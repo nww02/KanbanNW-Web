@@ -1,0 +1,424 @@
+# Rebuild Prompt: KanbanWeb
+
+> **Purpose of this file.** This is a complete, self-contained specification for regenerating
+> the KanbanWeb project from scratch. It is written as an HLD (High-Level Design) prompt:
+> it describes the system's parts, their names, responsibilities, behaviour, relationships and
+> rationale — deliberately *not* pasted source code — so an LLM can reimplement a functionally
+> equivalent app without copying this repo. Where a detail is a hard requirement (a key name, a
+> storage contract, a specific interaction), it is stated explicitly. Where something is a
+> design rationale, it is flagged as such.
+>
+> **Target.** Next.js (App Router) + React 19 + TypeScript + Tailwind CSS v4, statically
+> exported, zero backend, zero network calls, all state in `localStorage`.
+
+---
+
+## 1. Product summary
+
+**KanbanWeb** is a lightweight, single-user kanban board that runs entirely in the browser:
+no server, no sign-in, no backend. It is a web-port of a desktop dotNet/Avalonia app called
+"KanbanNW-KanbanNW" and keeps the same UX conventions (system columns, soft-delete, CSV/JSON
+exports). Everything — projects, columns, tasks, comments, category (type) names and appearance
+settings — lives in the browser's `localStorage`. The build emits a fully static site that can be
+served from any static host, a USB stick, or GitHub Pages.
+
+### Non-goals
+- No multi-user, no sync, no accounts, no remote persistence.
+- No drag-and-drop between *columns* reordering (only tasks reorder/move).
+- No task archiving beyond the soft-delete "Deleted Tasks" queue.
+- No fluff: this is a personal tool, so interactions are immediate and local.
+
+---
+
+## 2. Tech stack & build contract
+
+| Concern | Choice | Notes |
+|---|---|---|
+| Framework | Next.js 16 App Router, React 19 | Rendered as a pure static export |
+| Language | TypeScript, strict mode | Path alias `@/*` → `./src/*` |
+| Styling | Tailwind CSS v4 (`@import "tailwindcss"`) | PostCSS via `@tailwindcss/postcss` |
+| Drag & drop | `@dnd-kit/core`, `@dnd-kit/sortable`, `@dnd-kit/utilities` | v6/v10/v3 |
+| State persistence | Hand-rolled `localStorage` store module | Single JSON blob, full snapshot on each mutation |
+| Static export | `next.config.ts`: `output: "export"`, `trailingSlash: true` | `next build` writes to `out/` |
+| Serving for preview | `serve` (npm pkg) devDep, script `preview`: `serve out -l 8080` | Also a `web-serve.sh` convenience script |
+| npm scripts | `dev`, `build`, `preview` | No `next start` (invalid with export) |
+
+### Required files & configuration
+- `next.config.ts` — `output: "export"`, `trailingSlash: true`.
+- `postcss.config.mjs` — wires `@tailwindcss/postcss`.
+- `tailwind.config.ts` — may exist but is optional under Tailwind v4; if present, keep
+  `content` pointing at `./src/**/*.{ts,tsx}`. (Dark mode is configured in CSS, not here —
+  see §8.)
+- `tsconfig.json` — standard Next strict config with `@/*` path alias (as scaffolded by
+  `create-next-app`), plus `"lib": ["dom", "dom.iterable", "esnext"]`.
+- `package.json` — deps as above; devDeps: `typescript`, `tailwindcss`,
+  `@tailwindcss/postcss`, `@types/react`, `@types/react-dom`, `serve`.
+- `.gitignore` — ignore `node_modules`, `.next`, `out`, `.idea`, `next-env.d.ts`.
+
+---
+
+## 3. Data model (the `src/types/` contract)
+
+All ids are plain `number`s, single global sequence (see §4 `nextId`).
+
+- **Project** `{ id: number; name: string; color: string }` — color is a hex string, e.g.
+  `"#2C3E50"`.
+- **Column** `{ id: number; name: string; order: number; isSystem: boolean; projectId: number }`.
+- **Task** `{ id: number; title: string; createdAt: string(ISO); dueDate: string|null(ISO);
+  description: string; type: string; columnId: number; isComplete: boolean; order: number;
+  estimatedDays: number }`.
+- **Comment** `{ id: number; text: string; createdAt: string(ISO); taskId: number }`.
+- **TaskType** — an enum of 8 named types: `None, Red, Orange, Yellow, Green, Blue, Purple,
+  Black`, with a color map (None≈white, Red≈#EF5350, Blue≈#42A5F5, …) matching a fixed palette.
+  Types are stored on tasks as their string key.
+
+### System columns (constants, one projectId each)
+Three columns per project are created automatically with fixed `order` sentinels and
+`isSystem: true` — **In Tray** (order 0), **Done** (order 999), **Deleted Tasks** (order 1000).
+User columns get intermediate `order` values (ascending, renumber as needed). The Done and
+Deleted sentinels are how the UI identifies them robustly even if renamed.
+**Rationale:** system columns must never be deleted or renamed via the UI, and the Deleted
+column must not appear in the board unless "Show Deleted" is toggled.
+
+---
+
+## 4. The store (`src/lib/store.ts`)
+
+A singleton, module-level data store wrapping `localStorage`.
+
+### Contract
+- Storage key: `"kanbanweb_store_v1"`. Serialized shape:
+  `{ projects: Project[]; columns: Column[]; tasks: Task[]; comments: Comment[]; settings:
+  Record<string,string>; nextId: number }`.
+- `nextId` is the single id sequence for all entity types; every create bumps it.
+- Load: read + parse on first access; if the blob is missing/corrupt, start from an empty
+  store and **seed** it: one default project `"Default"` with color `#2C3E50`, its three system
+  columns, and default type-name settings (each `TaskTypeName_<type>` → the type's own name).
+- Save: after every mutation, write the entire store as pretty-printed JSON.
+- All read functions return copies/sorted views; callers never get live references to mutate.
+- `persist()` failure (quota, private mode) → `console.warn` and continue in-memory.
+
+### Public API (names + behaviour — implement to these, not the internals)
+- `getProjects()`, `getProject(id)`.
+- `createProject(name)`, `updateProject(id, name, color)`, `deleteProject(id)` — never delete
+  the last remaining project; deleting a project cascades to its columns, that columns' tasks,
+  and those tasks' comments.
+- `getColumnsForProject(projectId)` sorted by `order`; `createColumn`, `renameColumn` (system
+  columns immune), `deleteColumn` — on delete, move its tasks to that project's **In Tray**,
+  appending after existing In Tray tasks, and renumber.
+- `getInTrayColumn`, `getDoneColumn`, and a private `getOrCreateDeletedColumn` (create lazily).
+- `getTasksForColumn(columnId)` sorted by `order`; `getTaskById`.
+- `createTask` (appends with max order + 1), `updateTask`.
+- `moveTaskToColumnAtPosition(taskId, targetColumnId, insertIndex)` — THE core reorder/move
+  primitive. **Semantics:** (1) build the target column's current ordered list; (2) if moving
+  within the same column, remove the task from that list first, and if the requested index was
+  *after* its old index, decrement the index (this makes "pointer-based drop index" match — see
+  §7); (3) clamp index to [0, length]; (4) splice the task's id in at the index; (5) rewrite
+  every task in the target column with sequential `order` 0..n-1. Cross-column moves
+  automatically change `columnId`.
+- `moveTaskToDeletedColumn(taskId, projectId)` — soft delete: move into Deleted Tasks, append,
+  set `isComplete: false`.
+- `emptyDeletedColumn(projectId)` — permanently remove the Deleted-queue tasks and orphan the
+  comments of those tasks.
+- `getComments(taskId)` sorted by `createdAt`; `addComment(text, taskId)`.
+- Type-name helpers: `getTaskTypeNames()` → `Record<TaskType, string>`, `saveTaskTypeName`,
+  `getTaskTypeDisplayName`. Backing key: `settings["TaskTypeName_<type>"]`.
+- Settings: `getSetting(key, fallback?)`, `setSetting(key, value)`.
+- Backup: `exportStoreJson()` — the whole serialized store as pretty JSON (the `.kan` format);
+  `importStoreJson(json)` — validate shape (at least `projects`, `columns`, `tasks` arrays),
+  replace the in-memory store with the parsed content, sanitise `nextId` to
+  `max(used ids) + 1`, persist; return `false` (no change) if validation fails.
+
+---
+
+## 5. App shell & layout (`src/app/layout.tsx`, `globals.css`)
+
+- `layout.tsx`: `<html lang="en">` with metadata title **"KanbanNW-Web"** and a short
+  description. No fonts/graphQL/extra providers — the app is one client component.
+- `globals.css`:
+  - `@import "tailwindcss"`.
+  - **Dark mode variant (Tailwind v4):** `@custom-variant dark (&:where(.dark, .dark *));` —
+    this makes `dark:` utilities apply when an ancestor has class `.dark`. The app toggles
+    `.dark` on `<html>`. **Do not** set Tailwind's `darkMode` in config; this CSS variant is the
+    mechanism. **Rationale:** it is the supported v4 way and fixes the desktop-app parity where
+    the user picks a theme rather than following `prefers-color-scheme` only.
+  - **Font scaling presets:** define CSS variables `--text-xs/-sm/-base/-lg/-2xl` on `:root`
+    (Medium defaults ≈ 12/14/16/18/24px). Add `:root[data-font-size="small"]` and
+    `:root[data-font-size="large"]` blocks that re-define those variables (e.g. small ≈
+    10/12/13/14.5/18px; large ≈ 16/19/22/24/32px). **Rationale:** Tailwind v4's `text-*`
+    utilities resolve through these variables, so overriding them on `<html data-font-size>`/
+    `:root[data-font-size]` scales every font app-wide with no per-element work. These blocks
+    MUST use selector specificity `:root[data-font-size=…]` (0,1,1) — above plain `:root`
+    (0,1,0) — because Tailwind emits the `:root` defaults *after* the overrides in the output
+    CSS, and equal specificity would make the defaults win. Values are matched **lowercase** —
+    the app writes `dataset.fontSize` as lowercase (drop-down values are capitalized).
+  - `html.dark { color-scheme: dark }` / `html:not(.dark) { color-scheme: light }` so native
+    controls (scrollbars, date/`<select>`) follow the theme.
+  - `html, body { height: 100% }`, `body { overflow: hidden }` (the board scrolls internally),
+    a system-ui font stack, and a thin styled scrollbar class `.board-scroll` used on the
+    column bodies + dialogs.
+
+---
+
+## 6. Board component (`src/components/Board.tsx`) — the heart
+
+A single `"use client"` component (`page.tsx` renders `<Board />`). It owns all screen state
+except the store itself. Layout, top to bottom:
+
+1. **Menubar** (border-bottom, horizontal flex):
+   - **Kanban ▸** `Export ▸ Project to CSV`, `Export ▸ All Projects`; `Import ▸ Exported
+     Projects`; divider; `Reset All Data…`.
+   - **Config ▸** `Categories…`, `Columns…`, `Projects…`, a checkable `Show Deleted` toggle,
+     divider, `Appearance…`.
+   - Spacer, then **Help ▸** `Help`, divider, `About`.
+   - Implement the menu as hover-reveal submenus with CSS `group`/`group-hover` (no JS click
+     handling): a top-level `Menu` shows a dropdown on hover; a `SubMenu` opens to the right on
+     hover of its row (Tailwind `group/sub` + absolute positioning, `z-50`, bordered card).
+2. **Project tabs** — one button per project, filled with the project's colour, text coloured
+   by a `contrastText(hex)` luminance helper (black on light colours, white on dark). Active tab
+   has a `currentColor` outline. Clicking switches `currentProjectId`.
+3. **Board area** — `DndContext` wrapping a horizontal flex row of `DndColumn`s, each a fixed
+   `w-72` card. Drag interaction is described in §7. An empty state ("No tasks" dashed box)
+   shows in a column body when the list is empty.
+4. **Dialogs** — one global `dialog` state object (`{ name, …context }`) drives which modal
+   renders (see §9).
+
+### Appearance helpers (also in Board.tsx)
+- `FONT_PRESETS = ["Small","Medium","Large"]`.
+- `applyTheme(theme)`: `theme === "Dark"` or (`"System"` and OS prefers dark) → add `.dark` to
+  `<html>`, else remove.
+- `applyAppearance()`: read `fontPreset` (default `"Medium"`), set
+  `document.documentElement.dataset.fontSize` to the **lowercased** valid preset; then
+  `applyTheme(read "theme", default "System")`.
+- These run on mount (an effect), after importing a `.kan` file, and after the Appearance
+  dialog closes. In System mode, a `matchMedia("(prefers-color-scheme: dark)")` listener keeps
+  the theme live; a manual Light/Dark choice stores an explicit theme (which stops OS-following
+  until "System" is re-picked).
+- `isDark` React state mirrors `document.documentElement.classList.contains("dark")`, used by
+  the quick toggle (a `Dark`/`Light` menu item in Config, persisted as `theme`). **Note:** the
+  Appearance dialog's theme dropdown and this toggle share the same `theme` setting.
+
+### Export / import
+- CSV export: gather all tasks of the current project, build CSV rows (see §10), name the file
+  after the project slug, and hand off to the save-flow.
+- All-Projects export: save `exportStoreJson()` as `Kanban-Workspace-<yyyymmdd-hhmm>.kan`
+  (`application/json`).
+- Save-flow `exportFileWithNameDialog(defaultName, content, mimeType)`: if the browser supports
+  `showSaveFilePicker`, call `downloadTextFile` (native Save dialog, see §10). Otherwise open
+  the in-app **FilenameDialog**: a small modal with a prefilled name input; Enter submits, Esc
+  cancels; the name is sanitised of `/` and `\` before saving.
+- Import flow: confirm dialog (warns everything will be replaced), then a hidden `<input
+  type="file" accept=".kan,application/json,.json">`; read the file as text, call
+  `importStoreJson`; on failure `alert` a "not a Kanban export" message and change nothing; on
+  success reload appearance + board from the first project.
+- `Reset All Data…`: confirm, then `localStorage.clear()` + `location.reload()`.
+
+### Dialog routing (state shape)
+`dialog: { name: "task"|"confirm"|"filename"|"categories"|"columns"|"projects"|"appearance"|"help"|"about";
+task?; columnId?; confirmMessage?; onConfirm?; initialFilename?; onFilename? }`. A switch of
+`dialog.name` renders the right overlay, all using click-outside-to-close + Escape.
+
+---
+
+## 7. Drag & drop — the crucial part
+
+**Behaviour required:** dragging a task shows a single "ghost" that follows the intended drop
+position; moving *within* a column shows dnd-kit's native gap shift; moving *across* columns
+moves the ghost card into the target column at the pointer's insert position; if the pointer
+leaves all columns the ghost returns to its original slot. The drop must land exactly where the
+ghost was last shown. There must never be two simultaneous ghost visuals.
+
+### Components
+- **TaskCard** wraps each task (see §8). It uses `useSortable({ id })`; while `isDragging` the
+  real card is dimmed (`opacity: 0.4`).
+- **DndColumn** renders a column and its `SortableContext`. It receives from the board:
+  `tasks`, the currently dragged `draggedTask`, `ghostColumnId`, `ghostIndex`, and a
+  `setTaskListEl` callback to register its scrollable list node.
+
+### The single-ghost model (IMPORTANT — get this right)
+Do NOT use `DragOverlay`, and do NOT splice the dragged id into dnd-kit's `items` to fake a
+gap. Instead:
+
+1. Each column computes the ordered list of ids it **renders** (`useMemo`):
+   - No drag in progress → its own tasks.
+   - `ghostColumnId === this column` (drop target) → the dragged task's id is *removed from
+     wherever it currently is* (possibly this same column) and *inserted at `ghostIndex`*.
+     The `ghostIndex` already counts the "remove" (see §4 `moveTaskToColumnAtPosition`), so no
+     extra off-by-one.
+   - Any other column that currently lists the dragged id while the ghost is docked elsewhere →
+     that id is removed (the card has visibly left).
+   - If `ghostColumnId` is null (pointer off all columns) → the id stays/returns to its
+     original list at its original slot.
+   - The dragged id, when rendered by its column, is rendered as a **`GhostCard`**, not a
+     `TaskCard`: a `pointer-events-none`, dashed-border, dimmed card showing title (with
+     line-through when complete), a truncated 80-char description matching the real card's look,
+     and the type color badge.
+2. `SortableContext` is given the *rendered* id list but a **no-transform strategy**
+   (`() => ({ x:0, y:0, scaleX:1, scaleY:1 })`). **Rationale:** the in-flow ghost already
+   occupies the insertion space; letting dnd-kit also shift cards would create a double gap.
+3. No `<DragOverlay>` is rendered anywhere.
+
+### Collision detection: keep `rectIntersection` but snap to the list edges
+Use a wrapper collision function `columnSnapIntersection` around `rectIntersection`: if the top
+collision is not a sortable card (i.e. it's a column body) and the drag rectangle is below the
+last card or above the first card inside that column's x-range, return that last/first card as
+the collision so the ghost stays anchored at the list end/start instead of jumping to the
+column's original slot. **Rationale:** `over` alone snaps too eagerly.
+
+### Pointer-based insert index (the part that makes it feel right)
+Compute the drop index from the **pointer's Y**, not from `over`:
+
+- Register each column's list element via `setTaskListEl` into a `useRef<Record<columnId,
+  HTMLElement|null>>` in the board.
+- In `onDragMove`, compute the live pointer Y as
+  `(activatorEvent as PointerEvent).clientY + event.delta.y` (dnd-kit exposes the delta, not
+  the cursor — the activator event has the start Y).
+- `computeGhost(activeId, overId, pointerY)` resolves the target column (if `over` is a column
+  id, that column; else the `over` task's `columnId`), then walks
+  `listEl.querySelectorAll("[data-task-card]")` (TaskCard root has `data-task-card="true"`),
+  comparing `pointerY` against each card's vertical midpoint; insert before the first card whose
+  midpoint the pointer is above; default = end of list. No list element (empty column) → index 0.
+- `computeGhost` returns `{ columnId, index }` or `null`. **The same function drives both the
+  live ghost (`onDragMove`) and the actual drop (`onDragEnd` → `moveTaskToColumnAtPosition`),
+  so the ghost and final position always agree.**
+- `onDragMove` with `e.over == null` clears the ghost (returns it home). `onDragCancel` and
+  `onDragEnd` clear drag state.
+
+---
+
+## 8. TaskCard & GhostCard rendering
+
+### TaskCard (`src/components/TaskCard.tsx`, `"use client"`)
+Root: rounded, bordered, white/dark-grey card, `cursor-grab`, `useSortable` ref/handlers, the
+same `data-task-card` attribute, and a drag transform + `opacity: 0.4` when dragging. Inner
+layout:
+- Left: a 6px color strip (`TASK_TYPE_COLORS[type]`).
+- Body: **title** (bold, line-through + grey when `isComplete`); **description** only if
+  non-empty, muted small text, 2-line clamp, truncated to 80 chars + ellipsis; a **due-date
+  chip** if applicable — colored red (past due), orange (due within `estimatedDays` of today),
+  or green (else) and labelled `Due: <locale short date>`; bottom row: a **type badge**
+  (colored pill with the display name) and small icon buttons — **✓** (mark complete, only when
+  incomplete), **✎** (edit), **✕** (delete), each first `stopPropagation()` and calling the
+  corresponding prop.
+
+### GhostCard (defined inside DndColumn.tsx)
+Dashed/dimmed/`pointer-events-none` card, same column structure as TaskCard **minus the action
+buttons**, showing title, truncated description (same 80-char rule) and type badge. It exists
+only while a drag is in flight and marks the exact insertion point.
+
+---
+
+## 9. Dialogs
+
+All overlays: fixed inset-0, `bg-black/40` backdrop, `z-[100]`, click-on-backdrop closes,
+inner card stops propagation. Shared `Modal` shell (in `CategoriesDialog.tsx`): title header,
+scrollable body (`board-scroll`), footer with optional left action + Cancel/Save buttons.
+
+1. **TaskEditorModal** — a wide two-column modal. Left: title input; type picker (one button
+   per TaskType, colored by palette, selected shows ring); due-date date input + clear button;
+   estimated-days number input (min 1); description textarea. Right: comments list
+   (text + locale timestamp) + an add-comment input/button; comments typed before creating a
+   task are held locally and attached after creation. On save: validate title non-empty; create
+   (with `createdAt` now, `isComplete false`, auto-append a `"Task created"` comment) or update;
+   call `onSave(task)`.
+2. **ConfirmDialog** — message + Cancel / red Confirm.
+3. **FilenameDialog** — see §6.
+4. **CategoriesDialog** — one row per TaskType (color swatch, key, `text` input for its display
+   name) with "Reset to Defaults"; Save writes `TaskTypeName_*` settings.
+5. **ColumnsDialog** — list of the project's columns; system columns are read-only/swatched;
+   user columns editable + removable (✕); "+ Add Column" appends `New Column N` as a temp
+   (negative-id) row; Save applies add/remove/rename — removals first move the column's tasks
+   to **In Tray** (mirror the store's own semantics), then `deleteColumn`.
+6. **ProjectsDialog** — list of projects; color swatch cycles through a preset palette on
+   click; name input; ✕ removes (disabled when it's the last); "+ Add Project"; Save persists
+   renames/colors. Deleting the current project's tab switches the board to the first remaining.
+7. **AppearanceDialog** — exactly two controls (see §11).
+8. **HelpDialog** — two-pane: topic list on the left, content on the right (Welcome, Getting
+   Started, Managing Tasks/Columns/Projects, Appearance, Export & Import), Close button.
+9. **AboutDialog** — name, version, short blurb, warranty disclaimer, Close.
+
+---
+
+## 10. CSV export (`src/lib/csv.ts`)
+
+- `csvEscape(field)`: wrap in double quotes if the field contains `,`, `"` or newline (double
+  inner quotes).
+- `buildProjectCsv(tasks, columnNameOf)`: header
+  `Id,Title,CreatedAt,DueDate,Description,Type,Column,IsComplete,Order,EstimatedDays,Comments`;
+  rows pull live comments (joined with `" | "`), type display name via the settings, date only
+  (first 10 chars), `IsComplete` as 1/0.
+- `canUseSaveDialog()`: `typeof showSaveFilePicker === "function"`.
+- `downloadTextFile(fileName, content, mimeType)`: try `showSaveFilePicker` (suggested name +
+  file-type accept); on success create a writable, write, close and return; on
+  `AbortError` (user cancelled) return without falling back; on any other error, and in browsers
+  without the API (notably **Firefox on Linux**, which lands here), fall back to a programmatic
+  `<a download>` blob download. No caller inspects the return value.
+
+---
+
+## 11. Appearance settings (AppearanceDialog)
+
+- **State keys:** `settings["theme"]` ∈ `System | Light | Dark` (default `System`);
+  `settings["fontPreset"]` ∈ `Small | Medium | Large` (default `Medium`). No per-element font
+  sizes — those were removed.
+- UI: a Modal titled "Appearance Settings" with exactly two labelled dropdowns — **Theme**
+  and **Font Size** — and a "Reset to Defaults" footer button that resets to
+  System/Medium.
+- On Save: persist both settings, then call `applyTheme(theme)` and set the
+  `document.documentElement.dataset.fontSize` **lowercased** (`Small`→`small` etc.). The board's
+  `onClose` for this dialog re-runs `applyAppearance()` and syncs `isDark`.
+- **Theme semantics:** System = follow `prefers-color-scheme` live (a `matchMedia` change
+  listener); Light/Dark = explicit override. The menu-bar quick toggle flips `isDark` and stores
+  the explicit `"Light"`/`"Dark"`.
+- **Why the lowercase matters:** CSS attribute selectors are case-sensitive. The dropdown values
+  are capitalized but the CSS rules are `:root[data-font-size="small"|"large"]`. Writing the
+  attribute lowercase is the whole reason font presets work (a classic gotcha — flag it in the
+  code).
+
+---
+
+## 12. Store seeding & migration notes
+
+- First run seeds `Default` project + system columns + type-name defaults (see §4).
+- There is no migration framework; reading a blob simply requires `projects` to be an array
+  (a light validity check). Old/unused keys (e.g. legacy per-element font sizes) can be ignored
+  if present — the code should never *depend* on their presence.
+- `importStoreJson` sanitises `nextId` upward from max used id to avoid id collisions after
+  importing an older/edited backup.
+- When "Show Deleted" is off, the board hides any column with `order === 1000` (the Deleted
+  sentinel) — implemented in the board's column filtering, not the store.
+
+---
+
+## 13. Quality bar / acceptance checklist
+
+1. `npm run build` produces a clean static export (no TS errors, no Tailwind warnings).
+2. Theme: System follows the OS live; Light/Dark persist across reload; the menu-bar toggle and
+   the Appearance dropdown agree; native controls follow via `color-scheme`.
+3. Font Size: Small/Medium/Large visibly rescale **all** text (small ~3–6px smaller per step,
+   large clearly bigger — the spread must be obvious), persist across reload, and work in both
+   themes. This is the single most regression-prone feature (specificity + case gotchas).
+4. Drag & drop: within-column gap shift; cross-column ghost appears *in the target column at
+   the cursor's insert position*; leaving all columns returns the ghost home; exactly one ghost
+   visible at all times; drop lands where the ghost sat; same-column reorder works in both
+   directions.
+5. Exports: CSV opens correctly (quoted fields intact); `.kan` round-trips through Import.
+   On Firefox/Linux the filename-dialog SaveAs fallback appears (no native picker).
+6. Deleted-Tasks queue: soft-delete, "Empty Queue", and "Show Deleted" all behave; system
+   columns can't be deleted/renamed; last project can't be deleted.
+7. Empty states: board with no projects yet (seeded default), empty columns, empty Done/Deleted
+   queues render gracefully.
+
+---
+
+## 14. Rebuild hints / what NOT to do
+
+- Don't reach for a state library (Redux/Zustand) — the store module + React state is
+  deliberate and minimal.
+- Don't add a server, API routes, or fetch calls anywhere.
+- Don't rely on `prefers-color-scheme` alone for theme (the app has an explicit Light/Dark
+  user choice); don't use `darkMode` in tailwind.config — use the `@custom-variant` in CSS.
+- Don't put the dragged task into two visual places (no DragOverlay copy while also splicing
+  it into another column's items).
+- Mind the Tailwind v4 font-scale specificity and the lowercase `data-font-size` attribute —
+  both were real-world bugs that took multiple attempts to fix.

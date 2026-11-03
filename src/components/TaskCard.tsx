@@ -5,6 +5,13 @@ import { CSS } from "@dnd-kit/utilities";
 import type { KanbanTask } from "@/types/KanbanModels";
 import { TASK_TYPE_COLORS, TaskType } from "@/types/TaskType";
 
+/**
+ * Due-date urgency as a background colour + whether to show the chip:
+ *  - past due  → red (#EF5350)
+ *  - due within `estimatedDays` of today → orange (#FFA726)
+ *  - otherwise → green (#66BB6A)
+ * No dueDate means no chip at all.
+ */
 function dueDateStyle(task: KanbanTask): { bg: string; show: boolean } {
   if (!task.dueDate) return { bg: "transparent", show: false };
   const now = Date.now();
@@ -15,6 +22,7 @@ function dueDateStyle(task: KanbanTask): { bg: string; show: boolean } {
   return { bg: "#66BB6A", show: true }; // green
 }
 
+/** Human-readable due-date label for the chip, e.g. "Due: 3 Nov 2026". */
 function dueDateText(task: KanbanTask): string {
   if (!task.dueDate) return "";
   const d = new Date(task.dueDate);
@@ -34,7 +42,10 @@ export default function TaskCard({
   onDelete: () => void;
   onComplete: () => void;
 }) {
-  const {
+  // dnd-kit sortable wiring: the card is both a drag source (listeners) and a
+// droppable slot (setNodeRef). While the drag overlay handles the floating
+// copy, the card itself is dimmed to signal it has been picked up.
+const {
     attributes,
     listeners,
     setNodeRef,
@@ -55,6 +66,7 @@ export default function TaskCard({
   return (
     <div
       ref={setNodeRef}
+      data-task-card="true"
       style={style}
       {...attributes}
       {...listeners}

@@ -1,9 +1,8 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   DndContext,
-  DragOverlay,
   PointerSensor,
   rectIntersection,
   useSensor,
@@ -12,6 +11,7 @@ import {
   type Collision,
   type CollisionDetection,
   type DragStartEvent,
+  type DragMoveEvent,
   type DragEndEvent,
   type DroppableContainer,
   type UniqueIdentifier,
@@ -244,14 +244,91 @@ export default function Board() {
 
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
 
+  const [ghost, setGhost] = useState<{ columnId: number; index: number } | null>(null);
+
   const onDragStart = (e: DragStartEvent) => {
     const task = getTaskById(Number(e.active.id));
     if (task) setActiveDragTask(task);
   };
 
+  /**
+   * Where would the dragged task land?
+   *
+   * The index is keyed off the pointer's Y position against the target column's
+   * card midpoints — deliberately NOT dnd-kit's `over`, which snaps to the
+   * column (or nearest card) too readily and made the old ghost marker stick to
+   * the bottom of the list. Returns { columnId, index } where `index` is the
+   * insert position into that column's task list, or null when the pointer isn't
+   * over a valid target column.
+   *
+   * This single function drives BOTH the in-flow ghost position (rendered live
+   * during onDragMove) and the actual drop (in onDragEnd), so the ghost and the
+   * final position always agree.
+   */
+  const taskListEls = useRef<Record<number, HTMLElement | null>>({});
+
+  /** Registers a column's task-list element so computeGhost can measure its cards. */
+  const setTaskListEl = (columnId: number) => (el: HTMLElement | null) => {
+    taskListEls.current[columnId] = el;
+  };
+
+  const computeGhost = (activeId: number, overId: number, pointerY: number) => {
+    // If `over` is a column itself (header/body), target it directly.
+    const colId = columns.some((c) => c.id === overId)
+      ? (overId as number)
+      : getTaskById(overId)?.columnId;
+    if (colId == null) return null;
+
+    const colTasks = getTasksForColumn(colId);
+    const listEl = taskListEls.current[colId];
+    if (!listEl) {
+      // No measured list (e.g. empty column): the marker goes at the top.
+      return { columnId: colId, index: 0 };
+    }
+    // Where is the pointer relative to the top of the list? If the list has
+    // `space-y-2`, we need the midpoints of the cards. Find the card whose
+    // vertical midpoint the pointer is above (first such card = insert before it).
+    const cards = Array.from(listEl.querySelectorAll<HTMLElement>(
+      "[data-task-card]",
+    ));
+    const listRect = listEl.getBoundingClientRect();
+    const relY = pointerY - listRect.top;
+    let index = colTasks.length; // default: append at end
+    // Walk the cards; when the pointer is above a card's midpoint, insert before it.
+    for (let i = 0; i < cards.length; i++) {
+      const cardRect = cards[i].getBoundingClientRect();
+      const midY = cardRect.top - listRect.top + cardRect.height / 2;
+      if (relY < midY) {
+        index = i;
+        break;
+      }
+    }
+    return { columnId: colId, index };
+  };
+
+  const onDragMove = (e: DragMoveEvent) => {
+    // Pointer not over any droppable (menubar, gap between columns, …): clear
+    // the ghost so it visually returns to its original slot in its source column.
+    if (!e.over) {
+      setGhost(null);
+      return;
+    }
+    const activeId = Number(e.active.id);
+    const overId = Number(e.over.id);
+    // Live pointer Y = the Y where the drag started (activatorEvent) plus the
+    // cumulative drag delta. dnd-kit exposes the delta, not the live cursor, so
+    // this is the only reliable way to get the current pointer position.
+    const startY =
+      (e.activatorEvent as PointerEvent).clientY ??
+      (e.activatorEvent as MouseEvent).clientY;
+    const pointerY = startY + e.delta.y;
+    setGhost(computeGhost(activeId, overId, pointerY));
+  };
+
   const onDragEnd = (e: DragEndEvent) => {
     const { active, over } = e;
     setActiveDragTask(null);
+    setGhost(null);
     if (!over) return;
 
     const activeId = Number(active.id);
@@ -259,43 +336,25 @@ export default function Board() {
     const task = getTaskById(activeId);
     if (!task) return;
 
-    let targetColumnId: number | null = null;
-    let insertIndex = 0;
-
-    if (columns.some((c) => c.id === overId)) {
-      // dropped on the column body → append to end
-      targetColumnId = overId;
-      insertIndex = getTasksForColumn(overId).length;
-    } else {
-      const overTask = getTaskById(overId);
-      if (!overTask) return;
-      targetColumnId = overTask.columnId;
-      const colTasks = getTasksForColumn(overTask.columnId);
-      const overIdx = colTasks.findIndex((t) => t.id === overId);
-      if (overIdx < 0) {
-        insertIndex = colTasks.length;
-      } else if (task.columnId === targetColumnId) {
-        // Same column: dnd-kit's sortable convention is that the dragged card
-        // takes over the hovered card's slot (verified against the sortable
-        // strategy's transforms), so "below the last card" should land it at
-        // the end. moveTaskToColumnAtPosition expects an index relative to the
-        // full list and decrements it itself for downward moves, so compensate.
-        const oldIndex = colTasks.findIndex((t) => t.id === activeId);
-        insertIndex = overIdx > oldIndex ? overIdx + 1 : overIdx;
-      } else {
-        // Cross-column: take the hovered card's slot. The sorting strategy draws
-        // the last card's drop slot at the end of the list, so dropping on the
-        // last card appends rather than inserting before it.
-        insertIndex = overIdx === colTasks.length - 1 ? colTasks.length : overIdx;
-      }
-    }
-
-    if (targetColumnId == null) return;
-    moveTaskToColumnAtPosition(task.id, targetColumnId, insertIndex);
+    // Use the same pointer-based insert index as the ghost marker, so the drop
+    // lands exactly where the marker is shown.
+    const startY =
+      (e.activatorEvent as PointerEvent).clientY ??
+      (e.activatorEvent as MouseEvent).clientY;
+    const pointerY = startY + e.delta.y;
+    const target = computeGhost(activeId, overId, pointerY);
+    if (!target) return;
+    // NOTE: moveTaskToColumnAtPosition itself adjusts for same-column downward
+    // moves (it splices the task out first, then decrements the index), so the
+    // raw pointer-based index is exactly right to pass through.
+    moveTaskToColumnAtPosition(task.id, target.columnId, target.index);
     refreshBoard();
   };
 
-  const onDragCancel = () => setActiveDragTask(null);
+  const onDragCancel = () => {
+    setActiveDragTask(null);
+    setGhost(null);
+  };
 
   // ── task actions ─────────────────────────────────────────────────────────
 
@@ -308,20 +367,26 @@ export default function Board() {
     refreshBoard();
   };
 
-  const markComplete = (task: KanbanTask) => {
+  /**
+ * Mark a task done: move it into the (system) "Done" column and append it to
+ * the end of that column's list.
+ */
+const markComplete = (task: KanbanTask) => {
     const doneCol = getDoneColumn(currentProjectId);
     if (!doneCol) return;
     const updated: KanbanTask = {
       ...task,
       isComplete: true,
       columnId: doneCol.id,
+      // Append at the end — order is the max existing order (store renumbers).
       order: getTasksForColumn(doneCol.id).length,
     };
     updateTask(updated);
     refreshBoard();
   };
 
-  const requestDeleteTask = (task: KanbanTask) => {
+  /** Ask for confirmation, then soft-delete a task (moves it to the Deleted Tasks queue). */
+const requestDeleteTask = (task: KanbanTask) => {
     setDialog({
       name: "confirm",
       confirmMessage: `Are you sure you want to delete task "${task.title}"? It will be moved to the Deleted Tasks queue.`,
@@ -332,8 +397,9 @@ export default function Board() {
     });
   };
 
+  /** Ask for confirmation, then delete a user column (its tasks move to In Tray). */
   const requestDeleteColumn = (col: KanbanColumn) => {
-    if (col.isSystem) return;
+    if (col.isSystem) return; // system columns (In Tray/Done/Deleted) can't be removed
     setDialog({
       name: "confirm",
       confirmMessage: `Are you sure you want to delete the column "${col.name}"? All tasks will be moved to In Tray.`,
@@ -344,6 +410,7 @@ export default function Board() {
     });
   };
 
+  /** Ask for confirmation, then permanently empty the Deleted Tasks queue. */
   const requestEmptyQueue = () => {
     setDialog({
       name: "confirm",
@@ -357,7 +424,8 @@ export default function Board() {
 
   // ── config actions ───────────────────────────────────────────────────────
 
-  const exportCsv = () => {
+  /** Export the current project's tasks (with comments) as a CSV, named after the project. */
+const exportCsv = () => {
     const cols = getColumnsForProject(currentProjectId);
     const allTasks = cols.flatMap((c) => getTasksForColumn(c.id));
     const nameOf = (cid: number) => cols.find((c) => c.id === cid)?.name ?? `Column ${cid}`;
@@ -367,6 +435,7 @@ export default function Board() {
     exportFileWithNameDialog(`${slug || "project"}-tasks.csv`, csv);
   };
 
+  /** Export the whole workspace (all projects/columns/tasks/comments/settings) as a .kan backup. */
   const exportAllProjects = () => {
     exportFileWithNameDialog(`Kanban-Workspace-${timestampStamp()}.kan`, exportStoreJson(), "application/json");
   };
@@ -425,11 +494,17 @@ export default function Board() {
     });
   };
 
-  const restartApp = () => {
+  /** Wipe every key in localStorage and reload — the "Reset All Data" action. */
+const restartApp = () => {
     localStorage.clear();
     location.reload();
   };
 
+  /**
+   * Quick Light/Dark toggle in the app (separate from the Appearance dialog's
+   * System option). Turns the persisted theme into an explicit Light/Dark choice,
+   * which disables OS live-following until the user picks "System" again.
+   */
   const toggleTheme = () => {
     const next = isDark ? "Light" : "Dark";
     setSetting("theme", next);
@@ -507,6 +582,7 @@ export default function Board() {
             sensors={sensors}
             collisionDetection={columnSnapIntersection}
             onDragStart={onDragStart}
+            onDragMove={onDragMove}
             onDragEnd={onDragEnd}
             onDragCancel={onDragCancel}
           >
@@ -517,7 +593,10 @@ export default function Board() {
                   col={col}
                   tasks={tasksByColumn[col.id] ?? []}
                   typeNames={typeNames}
-                  draggedTaskId={activeDragTask?.id ?? null}
+                  draggedTask={activeDragTask}
+                  ghostColumnId={ghost?.columnId ?? null}
+                  ghostIndex={ghost?.index ?? null}
+                  setTaskListEl={setTaskListEl(col.id)}
                   onAddTask={() => openTaskEditor(undefined, col.id)}
                   onEditTask={(t) => openTaskEditor(t)}
                   onDeleteTask={requestDeleteTask}
@@ -527,14 +606,6 @@ export default function Board() {
                 />
               ))}
             </div>
-
-            <DragOverlay>
-              {activeDragTask ? (
-                <div className="w-72 rounded-lg border border-neutral-400 bg-white p-3 shadow-2xl dark:border-neutral-500 dark:bg-neutral-700">
-                  <div className="text-sm font-semibold">{activeDragTask.title}</div>
-                </div>
-              ) : null}
-            </DragOverlay>
           </DndContext>
         </div>
       </div>
@@ -669,6 +740,10 @@ function FilenameDialog({
 
 // ─── menu primitives ──────────────────────────────────────────────────────
 
+/**
+ * Top-level menu bar item. The dropdown is shown on hover via Tailwind's
+ * `group`/`group-hover` classes (no JS click handling needed).
+ */
 function Menu({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className="group relative">
@@ -682,6 +757,10 @@ function Menu({ label, children }: { label: string; children: React.ReactNode })
   );
 }
 
+/**
+ * A nested hover dropdown inside a Menu — opens to the right (`left-full`)
+ * when its parent Menu row is hovered, via `group/sub` + `group-hover/sub`.
+ */
 function SubMenu({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className="group/sub relative">

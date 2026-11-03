@@ -1,26 +1,18 @@
-# .NET
-bin/
-obj/
-*.user
-*.suo
-*.sln.docstates
-.vs/
-*.userosscache
-*.DotSettings.user
-
-# Rider
+# JetBrains / Rider
 .idea/
-*.sln.iml
-
-# NuGet
-packages/
-*.nupkg
+*.DotSettings.user
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Project specific
-KanbanNW/bin/
-KanbanNW/obj/
+# Project
 .claude/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+build/
+*.tsbuildinfo
+next-env.d.ts
